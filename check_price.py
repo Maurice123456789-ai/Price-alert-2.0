@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""
+Kinguin PSN 100 EUR gift card - price checker.
+
+Leest ALLEEN de prijs van de goedkoopste (bovenste) aanbieder op de
+productpagina. We gebruiken hiervoor het 'product:price:amount' meta-veld
+in de <head> van de pagina. Dit veld wordt door Kinguin gevuld met exact
+dezelfde prijs die bovenaan de pagina bij de goedkoopste verkoper wordt
+getoond, en is een uniek veld -> er is geen risico dat we per ongeluk een
+ander bedrag verderop op de pagina (reviews, "you may also like", etc.)
+oppikken.
+
+Cloudflare-uitdagingen worden bewust genegeerd: als de pagina niet
+opgehaald kan worden (block, captcha, timeout) stopt het script gewoon
+zonder alert en zonder de workflow te laten falen. De volgende run
+(15 min later) probeert het opnieuw.
+"""
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+import cloudscraper
+import requests
+from bs4 import BeautifulSoup
+
+PRODUCT_URL = (
+    "https://www.kinguin.net/category/95893/"
+    "playstation-network-eur-100-gift-card-nl"
+)
+
+PRICE_THRESHOLD_EUR = 87.0
+STATE_FILE = Path(__file__).resolve().parent.parent / "state" / "last_price.json"
+FALLBACK_EUR_TO_USD = 1.08  # gebruikt alleen als de wisselkoers-API faalt
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def fetch_page_html(url: str) -> str | None:
+    """Haalt de pagina op. Geeft None terug bij Cloudflare/netwerkfouten
+    (deze worden bewust genegeerd, zoals gevraagd)."""
+    scraper = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+    headers = {
+        "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
+    }
+    try:
+        resp = scraper.get(url, headers=headers, timeout=30)
+    except Exception as exc:  # netwerkfout, timeout, etc.
+        log(f"Kon pagina niet ophalen (genegeerd): {exc}")
+        return None
+
+    if resp.status_code != 200:
+        # Vaak een Cloudflare interstitial/challenge -> negeren
+        log(f"Onverwachte statuscode {resp.status_code} (genegeerd, mogelijk Cloudflare).")
+        return None
+
+    html = resp.text
+    if "Just a moment" in html or "cf-browser-verification" in html:
+        log("Cloudflare-uitdaging gedetecteerd (genegeerd).")
+        return None
+
+    return html
+
+
+def extract_cheapest_price_eur(html: str) -> float | None:
+    """Haalt de prijs van de goedkoopste (bovenste) aanbieder uit de
+    'product:price:amount' meta tag."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    meta = soup.find("meta", attrs={"property": "product:price:amount"})
+    if not meta or not meta.get("content"):
+        log("Kon 'product:price:amount' meta-veld niet vinden op de pagina.")
+        return None
+
+    try:
+        return float(meta["content"])
+    except (TypeError, ValueError):
+        log(f"Kon meta-waarde niet omzetten naar getal: {meta.get('content')!r}")
+        return None
+
+
+def get_eur_to_usd_rate() -> float:
+    """Actuele EUR->USD wisselkoers. Valt terug op een vaste koers als de
+    API niet bereikbaar is (dan gaat de check gewoon door)."""
+    try:
+        resp = requests.get(
+            "https://api.frankfurter.app/latest",
+            params={"from": "EUR", "to": "USD"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        rate = float(data["rates"]["USD"])
+        log(f"Wisselkoers EUR->USD opgehaald: {rate}")
+        return rate
+    except Exception as exc:
+        log(f"Kon wisselkoers niet ophalen, gebruik fallback {FALLBACK_EUR_TO_USD}: {exc}")
+        return FALLBACK_EUR_TO_USD
+
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {"last_alert_price_eur": None}
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def send_telegram_alert(price_eur: float, price_usd: float) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("TELEGRAM_BOT_TOKEN of TELEGRAM_CHAT_ID ontbreekt, kan geen alert versturen.")
+        return
+
+    text = (
+        "🎮 Kinguin PSN 100 EUR (NL) prijsalert!\n\n"
+        f"Goedkoopste aanbieder: €{price_eur:.2f} (${price_usd:.2f})\n"
+        f"Drempel: €{PRICE_THRESHOLD_EUR:.2f}\n\n"
+        f"{PRODUCT_URL}"
+    )
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(
+            url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": "false"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        log("Telegram-alert verstuurd.")
+    except Exception as exc:
+        log(f"Versturen van Telegram-alert mislukt: {exc}")
+
+
+def main() -> int:
+    html = fetch_page_html(PRODUCT_URL)
+    if html is None:
+        # Bewust geen fout/exit code != 0: Cloudflare hikjes negeren we.
+        return 0
+
+    price_eur = extract_cheapest_price_eur(html)
+    if price_eur is None:
+        # Pagina wel opgehaald, maar structuur onverwacht -> ook negeren,
+        # zodat de workflow niet als 'failed' aangemerkt wordt.
+        return 0
+
+    rate = get_eur_to_usd_rate()
+    price_usd = price_eur * rate
+
+    log(f"Huidige goedkoopste prijs: €{price_eur:.2f} (${price_usd:.2f})")
+
+    state = load_state()
+    last_alert_price = state.get("last_alert_price_eur")
+
+    if price_eur <= PRICE_THRESHOLD_EUR:
+        # Alleen opnieuw alerten als de prijs is veranderd t.o.v. de vorige
+        # keer dat we een alert stuurden. Zo krijg je niet elke 15 min
+        # dezelfde melding zolang de prijs onder de drempel blijft.
+        if last_alert_price is None or abs(last_alert_price - price_eur) > 0.001:
+            send_telegram_alert(price_eur, price_usd)
+            state["last_alert_price_eur"] = price_eur
+            save_state(state)
+        else:
+            log("Prijs nog steeds onder drempel maar ongewijzigd sinds vorige alert, geen nieuwe melding.")
+    else:
+        # Prijs weer boven de drempel: reset, zodat een volgende duik
+        # opnieuw een melding geeft.
+        if last_alert_price is not None:
+            state["last_alert_price_eur"] = None
+            save_state(state)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
