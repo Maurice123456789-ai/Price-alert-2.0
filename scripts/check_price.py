@@ -110,7 +110,9 @@ def fetch_page_html(url: str) -> str | None:
         return fallback[1]
 
     if fallback:
-        log(f"Ook ScraperAPI gaf een probleem (statuscode {fallback[0]}), genegeerd.")
+        status, body = fallback
+        snippet = body[:300].replace("\n", " ")
+        log(f"Ook ScraperAPI gaf een probleem (statuscode {status}), genegeerd. Details: {snippet}")
     else:
         log("ScraperAPI-fallback leverde niks op, genegeerd.")
 
