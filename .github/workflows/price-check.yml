@@ -1,0 +1,44 @@
+name: Kinguin PSN prijscheck
+
+on:
+  schedule:
+    # Elke 15 minuten. GitHub Actions cron draait op UTC en kan een paar
+    # minuten vertraging hebben tijdens drukte, dat is normaal.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}   # laat je de check ook handmatig starten via de Actions-tab
+
+permissions:
+  contents: write   # nodig om state/last_price.json te mogen updaten
+
+jobs:
+  check-price:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repo uitchecken
+        uses: actions/checkout@v4
+
+      - name: Python installeren
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Dependencies installeren
+        run: pip install -r requirements.txt
+
+      - name: Prijs checken
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/check_price.py
+
+      - name: State-bestand committen (indien gewijzigd)
+        run: |
+          if ! git diff --quiet -- state/last_price.json; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add state/last_price.json
+            git commit -m "Update laatste alert-prijs [skip ci]"
+            git push
+          else
+            echo "Geen wijzigingen in state-bestand."
+          fi
