@@ -21,6 +21,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 import cloudscraper
 import requests
@@ -37,15 +38,23 @@ FALLBACK_EUR_TO_USD = 1.08  # gebruikt alleen als de wisselkoers-API faalt
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")  # optioneel, voor Cloudflare-fallback
 
 
 def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def fetch_page_html(url: str) -> str | None:
-    """Haalt de pagina op. Geeft None terug bij Cloudflare/netwerkfouten
-    (deze worden bewust genegeerd, zoals gevraagd)."""
+def is_blocked(status_code: int, html: str) -> bool:
+    if status_code != 200:
+        return True
+    if "Just a moment" in html or "cf-browser-verification" in html:
+        return True
+    return False
+
+
+def fetch_direct(url: str) -> tuple[int, str] | None:
+    """Probeert de pagina rechtstreeks op te halen (gratis, geen quotum)."""
     scraper = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "mobile": False}
     )
@@ -54,21 +63,58 @@ def fetch_page_html(url: str) -> str | None:
     }
     try:
         resp = scraper.get(url, headers=headers, timeout=30)
-    except Exception as exc:  # netwerkfout, timeout, etc.
-        log(f"Kon pagina niet ophalen (genegeerd): {exc}")
+    except Exception as exc:
+        log(f"Direct ophalen mislukt (genegeerd): {exc}")
+        return None
+    return resp.status_code, resp.text
+
+
+def fetch_via_scraperapi(url: str) -> tuple[int, str] | None:
+    """Fallback via ScraperAPI, alleen gebruikt als direct ophalen faalt
+    en er een SCRAPER_API_KEY secret is ingesteld."""
+    if not SCRAPER_API_KEY:
+        return None
+    api_url = (
+        f"https://api.scraperapi.com/?api_key={SCRAPER_API_KEY}"
+        f"&url={quote(url, safe='')}"
+    )
+    try:
+        resp = requests.get(api_url, timeout=60)
+    except Exception as exc:
+        log(f"ScraperAPI-aanvraag mislukt (genegeerd): {exc}")
+        return None
+    return resp.status_code, resp.text
+
+
+def fetch_page_html(url: str) -> str | None:
+    """Haalt de pagina op: eerst direct, en bij een block (403 e.d.) via
+    ScraperAPI als daarvoor een API key is ingesteld. Geeft None terug als
+    beide falen (Cloudflare/netwerkfouten worden bewust genegeerd)."""
+    result = fetch_direct(url)
+    if result and not is_blocked(*result):
+        return result[1]
+
+    if result:
+        log(f"Onverwachte statuscode {result[0]} bij direct ophalen (mogelijk Cloudflare).")
+    else:
+        log("Direct ophalen leverde niks op.")
+
+    if not SCRAPER_API_KEY:
+        log("Geen SCRAPER_API_KEY ingesteld, sla fallback over (genegeerd).")
         return None
 
-    if resp.status_code != 200:
-        # Vaak een Cloudflare interstitial/challenge -> negeren
-        log(f"Onverwachte statuscode {resp.status_code} (genegeerd, mogelijk Cloudflare).")
-        return None
+    log("Probeer fallback via ScraperAPI...")
+    fallback = fetch_via_scraperapi(url)
+    if fallback and not is_blocked(*fallback):
+        log("Pagina succesvol opgehaald via ScraperAPI.")
+        return fallback[1]
 
-    html = resp.text
-    if "Just a moment" in html or "cf-browser-verification" in html:
-        log("Cloudflare-uitdaging gedetecteerd (genegeerd).")
-        return None
+    if fallback:
+        log(f"Ook ScraperAPI gaf een probleem (statuscode {fallback[0]}), genegeerd.")
+    else:
+        log("ScraperAPI-fallback leverde niks op, genegeerd.")
 
-    return html
+    return None
 
 
 def extract_cheapest_price_eur(html: str) -> float | None:
