@@ -14,12 +14,18 @@ Cloudflare-uitdagingen worden bewust genegeerd: als de pagina niet
 opgehaald kan worden (block, captcha, timeout) stopt het script gewoon
 zonder alert en zonder de workflow te laten falen. De volgende run
 (15 min later) probeert het opnieuw.
+
+Naast de alert bij €87 of lager, stuurt het script ook elke 6 uur een
+periodieke samenvatting met de actuele laagste prijs, ongeacht of die
+onder de drempel zit. Dit laat zien dat er regelmatig gecontroleerd
+wordt, ook als er (nog) geen koopje is.
 """
 
 import json
 import os
 import re
 import sys
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -35,6 +41,7 @@ PRODUCT_URL = (
 PRICE_THRESHOLD_EUR = 87.0
 STATE_FILE = Path(__file__).resolve().parent.parent / "state" / "last_price.json"
 FALLBACK_EUR_TO_USD = 1.08  # gebruikt alleen als de wisselkoers-API faalt
+SUMMARY_INTERVAL = timedelta(hours=6)  # hoe vaak een sowieso-samenvatting gestuurd wordt
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -158,10 +165,13 @@ def get_eur_to_usd_rate() -> float:
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text())
+            data = json.loads(STATE_FILE.read_text())
+            data.setdefault("last_alert_price_eur", None)
+            data.setdefault("last_summary_at", None)
+            return data
         except Exception:
             pass
-    return {"last_alert_price_eur": None}
+    return {"last_alert_price_eur": None, "last_summary_at": None}
 
 
 def save_state(state: dict) -> None:
@@ -169,17 +179,11 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def send_telegram_alert(price_eur: float, price_usd: float) -> None:
+def send_telegram_message(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log("TELEGRAM_BOT_TOKEN of TELEGRAM_CHAT_ID ontbreekt, kan geen alert versturen.")
-        return
+        log("TELEGRAM_BOT_TOKEN of TELEGRAM_CHAT_ID ontbreekt, kan geen bericht versturen.")
+        return False
 
-    text = (
-        "🎮 Kinguin PSN 100 EUR (NL) prijsalert!\n\n"
-        f"Goedkoopste aanbieder: €{price_eur:.2f} (${price_usd:.2f})\n"
-        f"Drempel: €{PRICE_THRESHOLD_EUR:.2f}\n\n"
-        f"{PRODUCT_URL}"
-    )
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         resp = requests.post(
@@ -188,9 +192,35 @@ def send_telegram_alert(price_eur: float, price_usd: float) -> None:
             timeout=15,
         )
         resp.raise_for_status()
-        log("Telegram-alert verstuurd.")
+        log("Telegram-bericht verstuurd.")
+        return True
     except Exception as exc:
-        log(f"Versturen van Telegram-alert mislukt: {exc}")
+        log(f"Versturen van Telegram-bericht mislukt: {exc}")
+        return False
+
+
+def build_alert_text(price_eur: float, price_usd: float) -> str:
+    return (
+        "🎮 Kinguin PSN 100 EUR (NL) prijsalert!\n\n"
+        f"Goedkoopste aanbieder: €{price_eur:.2f} (${price_usd:.2f})\n"
+        f"Drempel: €{PRICE_THRESHOLD_EUR:.2f}\n\n"
+        f"{PRODUCT_URL}"
+    )
+
+
+def build_summary_text(price_eur: float, price_usd: float) -> str:
+    now_str = datetime.now(timezone.utc).strftime("%d-%m-%Y %H:%M UTC")
+    status = (
+        "✅ Onder de drempel!" if price_eur <= PRICE_THRESHOLD_EUR
+        else f"Nog boven de drempel van €{PRICE_THRESHOLD_EUR:.2f}."
+    )
+    return (
+        "🕒 Periodieke update — Kinguin PSN 100 EUR (NL)\n\n"
+        f"Actuele laagste prijs: €{price_eur:.2f} (${price_usd:.2f})\n"
+        f"{status}\n\n"
+        f"Laatst gecontroleerd: {now_str}\n"
+        f"{PRODUCT_URL}"
+    )
 
 
 def main() -> int:
@@ -212,15 +242,18 @@ def main() -> int:
 
     state = load_state()
     last_alert_price = state.get("last_alert_price_eur")
+    last_summary_at_raw = state.get("last_summary_at")
+
+    state_changed = False
 
     if price_eur <= PRICE_THRESHOLD_EUR:
         # Alleen opnieuw alerten als de prijs is veranderd t.o.v. de vorige
         # keer dat we een alert stuurden. Zo krijg je niet elke 15 min
         # dezelfde melding zolang de prijs onder de drempel blijft.
         if last_alert_price is None or abs(last_alert_price - price_eur) > 0.001:
-            send_telegram_alert(price_eur, price_usd)
+            send_telegram_message(build_alert_text(price_eur, price_usd))
             state["last_alert_price_eur"] = price_eur
-            save_state(state)
+            state_changed = True
         else:
             log("Prijs nog steeds onder drempel maar ongewijzigd sinds vorige alert, geen nieuwe melding.")
     else:
@@ -228,7 +261,29 @@ def main() -> int:
         # opnieuw een melding geeft.
         if last_alert_price is not None:
             state["last_alert_price_eur"] = None
-            save_state(state)
+            state_changed = True
+
+    # Periodieke samenvatting, ongeacht de drempel, zodat volgers zien dat
+    # er regelmatig gecheckt wordt.
+    now = datetime.now(timezone.utc)
+    send_summary = True
+    if last_summary_at_raw:
+        try:
+            last_summary_at = datetime.fromisoformat(last_summary_at_raw)
+            send_summary = (now - last_summary_at) >= SUMMARY_INTERVAL
+        except ValueError:
+            send_summary = True
+
+    if send_summary:
+        if send_telegram_message(build_summary_text(price_eur, price_usd)):
+            state["last_summary_at"] = now.isoformat()
+            state_changed = True
+    else:
+        wait_left = SUMMARY_INTERVAL - (now - last_summary_at)
+        log(f"Nog {wait_left} tot de volgende periodieke samenvatting.")
+
+    if state_changed:
+        save_state(state)
 
     return 0
 
