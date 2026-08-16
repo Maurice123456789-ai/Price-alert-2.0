@@ -201,25 +201,30 @@ def send_telegram_message(text: str) -> bool:
 
 def build_alert_text(price_eur: float, price_usd: float) -> str:
     return (
-        "🎮 Kinguin PSN 100 EUR (NL) prijsalert!\n\n"
-        f"Goedkoopste aanbieder: €{price_eur:.2f} (${price_usd:.2f})\n"
-        f"Drempel: €{PRICE_THRESHOLD_EUR:.2f}\n\n"
+        "🚨🔥 PRIJSKNALLER! 🔥🚨\n\n"
+        "Kinguin PSN 100 EUR (NL) tegoedkaart is nú te scoren voor:\n\n"
+        f"💶 €{price_eur:.2f}  |  💵 ${price_usd:.2f}\n\n"
+        f"Dat is onder onze drempel van €{PRICE_THRESHOLD_EUR:.0f}! Wees er snel bij, "
+        "dit soort prijzen zijn zo weer weg 👇\n\n"
         f"{PRODUCT_URL}"
     )
 
 
 def build_summary_text(price_eur: float, price_usd: float) -> str:
-    now_str = datetime.now(timezone.utc).strftime("%d-%m-%Y %H:%M UTC")
-    status = (
-        "✅ Onder de drempel!" if price_eur <= PRICE_THRESHOLD_EUR
-        else f"Nog boven de drempel van €{PRICE_THRESHOLD_EUR:.2f}."
-    )
+    if price_eur <= PRICE_THRESHOLD_EUR:
+        header = "🔥 6-uurs update: scherpe prijs gespot!"
+        status = f"✅ Dit zit onder onze drempel van €{PRICE_THRESHOLD_EUR:.0f} — nu toeslaan dus!"
+    else:
+        header = "📊 6-uurs update"
+        status = f"👀 Nog boven onze sweet spot van €{PRICE_THRESHOLD_EUR:.0f}, we blijven scherp checken."
+
     return (
-        "🕒 Periodieke update — Kinguin PSN 100 EUR (NL)\n\n"
-        f"Actuele laagste prijs: €{price_eur:.2f} (${price_usd:.2f})\n"
+        f"{header}\n\n"
+        "Elke 6 uur checken we de prijs voor je 👇\n\n"
+        "Kinguin PSN 100 EUR (NL) tegoedkaart:\n\n"
+        f"💶 €{price_eur:.2f}  |  💵 ${price_usd:.2f}\n\n"
         f"{status}\n\n"
-        f"Laatst gecontroleerd: {now_str}\n"
-        f"{PRODUCT_URL}"
+        f"👉 {PRODUCT_URL}"
     )
 
 
