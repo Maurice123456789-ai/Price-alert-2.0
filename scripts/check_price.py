@@ -37,11 +37,13 @@ PRODUCT_URL = (
     "https://www.kinguin.net/category/95893/"
     "playstation-network-eur-100-gift-card-nl"
 )
+COUPON_SOURCE_URL = "https://www.planetkey.de/shops/kinguin"
 
 PRICE_THRESHOLD_EUR = 87.0
 STATE_FILE = Path(__file__).resolve().parent.parent / "state" / "last_price.json"
 FALLBACK_EUR_TO_USD = 1.08  # gebruikt alleen als de wisselkoers-API faalt
 SUMMARY_INTERVAL = timedelta(hours=6)  # hoe vaak een sowieso-samenvatting gestuurd wordt
+COUPON_CHECK_INTERVAL = timedelta(hours=24)  # het is een maandcode, dus 1x per dag is genoeg
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -126,6 +128,40 @@ def fetch_page_html(url: str) -> str | None:
     return None
 
 
+def extract_coupon_code(html: str) -> tuple[str, str] | None:
+    """Haalt de huidige Kinguin-kortingscode en het kortingspercentage op
+    van planetkey.de, een Duitse prijsvergelijkingssite die de code in
+    platte tekst toont (in tegenstelling tot de meeste coupon-sites, die
+    'm achter een verplichte klik verstoppen). Geeft (code, percentage)
+    terug, of None als er niks gevonden wordt."""
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+
+    match = re.search(r'(\d{1,2})%\s*Gutscheincode[:\s"]*([A-Z0-9]{4,14})', text)
+    if not match:
+        log("Kon geen kortingscode vinden op planetkey.de.")
+        return None
+
+    percentage, code = match.groups()
+    return code, percentage
+
+
+def get_current_coupon() -> tuple[str, str] | None:
+    """Haalt de actuele kortingscode op. Faalt stil (geeft None) bij
+    Cloudflare/netwerkproblemen, net als de prijs-check."""
+    html = fetch_page_html(COUPON_SOURCE_URL)
+    if html is None:
+        return None
+    return extract_coupon_code(html)
+
+
+def format_coupon_line(coupon: tuple[str, str] | None) -> str:
+    if coupon is None:
+        return ""
+    code, percentage = coupon
+    return f"\n🎟️ Extra korting met code: {code} ({percentage}% erbij!)\n"
+
+
 def extract_cheapest_price_eur(html: str) -> float | None:
     """Haalt de prijs van de goedkoopste (bovenste) aanbieder uit de
     'product:price:amount' meta tag."""
@@ -168,10 +204,19 @@ def load_state() -> dict:
             data = json.loads(STATE_FILE.read_text())
             data.setdefault("last_alert_price_eur", None)
             data.setdefault("last_summary_at", None)
+            data.setdefault("coupon_code", None)
+            data.setdefault("coupon_percentage", None)
+            data.setdefault("coupon_checked_at", None)
             return data
         except Exception:
             pass
-    return {"last_alert_price_eur": None, "last_summary_at": None}
+    return {
+        "last_alert_price_eur": None,
+        "last_summary_at": None,
+        "coupon_code": None,
+        "coupon_percentage": None,
+        "coupon_checked_at": None,
+    }
 
 
 def save_state(state: dict) -> None:
@@ -199,18 +244,19 @@ def send_telegram_message(text: str) -> bool:
         return False
 
 
-def build_alert_text(price_eur: float, price_usd: float) -> str:
+def build_alert_text(price_eur: float, price_usd: float, coupon: tuple[str, str] | None) -> str:
     return (
         "🚨🔥 PRIJSKNALLER! 🔥🚨\n\n"
         "Kinguin PSN 100 EUR (NL) tegoedkaart is nú te scoren voor:\n\n"
         f"💶 €{price_eur:.2f}  |  💵 ${price_usd:.2f}\n\n"
         f"Dat is onder onze drempel van €{PRICE_THRESHOLD_EUR:.0f}! Wees er snel bij, "
-        "dit soort prijzen zijn zo weer weg 👇\n\n"
+        "dit soort prijzen zijn zo weer weg 👇\n"
+        f"{format_coupon_line(coupon)}\n"
         f"{PRODUCT_URL}"
     )
 
 
-def build_summary_text(price_eur: float, price_usd: float) -> str:
+def build_summary_text(price_eur: float, price_usd: float, coupon: tuple[str, str] | None) -> str:
     if price_eur <= PRICE_THRESHOLD_EUR:
         header = "🔥 6-uurs update: scherpe prijs gespot!"
         status = f"✅ Dit zit onder onze drempel van €{PRICE_THRESHOLD_EUR:.0f} — nu toeslaan dus!"
@@ -223,7 +269,8 @@ def build_summary_text(price_eur: float, price_usd: float) -> str:
         "Elke 6 uur checken we de prijs voor je 👇\n\n"
         "Kinguin PSN 100 EUR (NL) tegoedkaart:\n\n"
         f"💶 €{price_eur:.2f}  |  💵 ${price_usd:.2f}\n\n"
-        f"{status}\n\n"
+        f"{status}\n"
+        f"{format_coupon_line(coupon)}\n"
         f"👉 {PRODUCT_URL}"
     )
 
@@ -248,15 +295,46 @@ def main() -> int:
     state = load_state()
     last_alert_price = state.get("last_alert_price_eur")
     last_summary_at_raw = state.get("last_summary_at")
+    coupon_checked_at_raw = state.get("coupon_checked_at")
 
     state_changed = False
+    now = datetime.now(timezone.utc)
+
+    # Kortingscode is een maandcode, dus die hoeft maar 1x per 24 uur
+    # opnieuw gecheckt te worden. Tussendoor gebruiken we de laatst
+    # bekende code (uit de state) in elk bericht.
+    refresh_coupon = True
+    if coupon_checked_at_raw:
+        try:
+            coupon_checked_at = datetime.fromisoformat(coupon_checked_at_raw)
+            refresh_coupon = (now - coupon_checked_at) >= COUPON_CHECK_INTERVAL
+        except ValueError:
+            refresh_coupon = True
+
+    if refresh_coupon:
+        fresh_coupon = get_current_coupon()
+        if fresh_coupon:
+            state["coupon_code"], state["coupon_percentage"] = fresh_coupon
+            state["coupon_checked_at"] = now.isoformat()
+            state_changed = True
+            log(f"Kortingscode ververst: {fresh_coupon[0]} ({fresh_coupon[1]}%)")
+        else:
+            log("Kon geen nieuwe kortingscode ophalen, gebruik eventueel eerder bekende code.")
+    else:
+        log("Kortingscode is nog geen 24 uur oud, gebruik gecachte waarde.")
+
+    coupon = (
+        (state["coupon_code"], state["coupon_percentage"])
+        if state.get("coupon_code")
+        else None
+    )
 
     if price_eur <= PRICE_THRESHOLD_EUR:
         # Alleen opnieuw alerten als de prijs is veranderd t.o.v. de vorige
         # keer dat we een alert stuurden. Zo krijg je niet elke 15 min
         # dezelfde melding zolang de prijs onder de drempel blijft.
         if last_alert_price is None or abs(last_alert_price - price_eur) > 0.001:
-            send_telegram_message(build_alert_text(price_eur, price_usd))
+            send_telegram_message(build_alert_text(price_eur, price_usd, coupon))
             state["last_alert_price_eur"] = price_eur
             state_changed = True
         else:
@@ -270,7 +348,6 @@ def main() -> int:
 
     # Periodieke samenvatting, ongeacht de drempel, zodat volgers zien dat
     # er regelmatig gecheckt wordt.
-    now = datetime.now(timezone.utc)
     send_summary = True
     if last_summary_at_raw:
         try:
@@ -280,7 +357,7 @@ def main() -> int:
             send_summary = True
 
     if send_summary:
-        if send_telegram_message(build_summary_text(price_eur, price_usd)):
+        if send_telegram_message(build_summary_text(price_eur, price_usd, coupon)):
             state["last_summary_at"] = now.isoformat()
             state_changed = True
     else:
