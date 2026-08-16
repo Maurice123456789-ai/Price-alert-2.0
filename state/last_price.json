@@ -1,4 +1,7 @@
 {
   "last_alert_price_eur": null,
-  "last_summary_at": "2026-08-16T12:01:32.462345+00:00"
+  "last_summary_at": null,
+  "coupon_code": null,
+  "coupon_percentage": null,
+  "coupon_checked_at": null
 }
