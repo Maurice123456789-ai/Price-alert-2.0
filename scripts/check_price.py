@@ -37,16 +37,6 @@ PRODUCT_URL = (
     "https://www.kinguin.net/category/95893/"
     "playstation-network-eur-100-gift-card-nl"
 )
-# Link die in Telegram-berichten getoond wordt (met affiliate-parameters,
-# zodat kliks van volgers aan jouw account toegeschreven worden). Bewust
-# gescheiden van PRODUCT_URL hierboven: de scraper gebruikt de kale URL,
-# dat is stabieler en voorkomt dat tracking-parameters de Cloudflare-check
-# of de getoonde prijs/valuta-variant beïnvloeden.
-AFFILIATE_URL = (
-    f"{PRODUCT_URL}"
-    "?afsrc=1&im_ref=xKn0HOwMxxyZWYkT99VAhW3qUkr0XVTxgSyG3U0"
-    "&irgwc=1&irpid=4484401&sharedid="
-)
 COUPON_SOURCE_URL = "https://www.planetkey.de/shops/kinguin"
 
 PRICE_THRESHOLD_EUR = 87.0
@@ -262,7 +252,7 @@ def build_alert_text(price_eur: float, price_usd: float, coupon: tuple[str, str]
         f"Dat is onder onze drempel van €{PRICE_THRESHOLD_EUR:.0f}! Wees er snel bij, "
         "dit soort prijzen zijn zo weer weg 👇\n"
         f"{format_coupon_line(coupon)}\n"
-        f"{AFFILIATE_URL}"
+        f"{PRODUCT_URL}"
     )
 
 
@@ -281,7 +271,7 @@ def build_summary_text(price_eur: float, price_usd: float, coupon: tuple[str, st
         f"💶 €{price_eur:.2f}  |  💵 ${price_usd:.2f}\n\n"
         f"{status}\n"
         f"{format_coupon_line(coupon)}\n"
-        f"👉 {AFFILIATE_URL}"
+        f"👉 {PRODUCT_URL}"
     )
 
 
